@@ -8,21 +8,23 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from .models import utc_now_iso
+from .paths import safe_child_path
 
 
 class LocalEvidenceStore:
     def __init__(self, root_dir: Path, study_name: str, run_dir: Path = None):
         if run_dir is None:
+            safe_child_path(root_dir, study_name, "study_name")
             safe_name = study_name.replace(" ", "-")
             timestamp = utc_now_iso().replace(":", "-")
-            self.run_dir = (root_dir / f"{safe_name}-{timestamp}").resolve()
+            self.run_dir = safe_child_path(root_dir, f"{safe_name}-{timestamp}", "run name")
             self.run_dir.mkdir(parents=True, exist_ok=False)
         else:
             self.run_dir = Path(run_dir).resolve()
             self.run_dir.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
-        (self.run_dir / "artifacts").mkdir(exist_ok=True)
-        (self.run_dir / "trials").mkdir(exist_ok=True)
+        safe_child_path(self.run_dir, "artifacts", "artifact directory").mkdir(exist_ok=True)
+        safe_child_path(self.run_dir, "trials", "trial directory").mkdir(exist_ok=True)
 
     @classmethod
     def open_run_dir(cls, run_dir: Path) -> "LocalEvidenceStore":
@@ -62,7 +64,8 @@ class LocalEvidenceStore:
         self._write_json(self.run_dir / "summary.json", summary)
 
     def create_trial_workspace(self, trial_id: str) -> Path:
-        workspace = self.run_dir / "trials" / trial_id
+        trials_root = safe_child_path(self.run_dir, "trials", "trial directory")
+        workspace = safe_child_path(trials_root, trial_id, "trial_id")
         workspace.mkdir(parents=True, exist_ok=True)
         return workspace
 
