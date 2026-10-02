@@ -10,6 +10,9 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Dict, List, Optional, Sequence
 
 
+from .paths import safe_child_path
+
+
 JsonDict = Dict[str, Any]
 
 DEFAULT_EXCLUDE_NAMES = {
@@ -129,7 +132,7 @@ class CodeArtifactStore:
             raise ValueError("code_file artifacts must contain exactly one file.")
 
         artifact_id = artifact_id or f"artifact-code-{uuid.uuid4().hex[:12]}"
-        artifact_root = self.root_dir / artifact_id
+        artifact_root = safe_child_path(self.root_dir, artifact_id, "artifact_id")
         files_root = artifact_root / "files"
         if artifact_root.exists():
             raise FileExistsError(f"Code artifact already exists: {artifact_root}")

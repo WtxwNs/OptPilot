@@ -191,3 +191,13 @@ The smoke script re-executes itself through `uv run` when needed.
 ## Release Note
 
 OptPilot is licensed under the Apache License 2.0. See [LICENSE](LICENSE).
+
+## Local UI safety
+
+The experimental `optpilot ui` server is unauthenticated and binds only to
+`127.0.0.1` or `localhost`. Open it directly at the printed local URL. Do not
+expose it through a public proxy or port-forwarding service. Study launch
+executes user-owned code with the current user's privileges; only use trusted
+configs, engines, and environments. The UI restricts file previews to its static
+assets and configured run roots (including output roots of UI-launched jobs).
+Browser API mutations require same-origin JSON requests.
