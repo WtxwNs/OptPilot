@@ -27,6 +27,13 @@ from ..registry import BUILTIN_COMPONENTS
 
 JsonDict = Dict[str, Any]
 
+
+class UiRequestError(ValueError):
+    def __init__(self, message: str, status: HTTPStatus = HTTPStatus.BAD_REQUEST):
+        super().__init__(message)
+        self.status = status
+
+
 RUN_SENTINEL_FILES = {
     "study_spec.json",
     "observations.jsonl",
@@ -184,6 +191,8 @@ def run_ui(
     run_roots: Optional[List[str]] = None,
     open_browser: bool = False,
 ) -> None:
+    if host not in {"127.0.0.1", "localhost"}:
+        raise ValueError("The unauthenticated UI must bind to 127.0.0.1 or localhost.")
     cwd = Path.cwd().resolve()
     state = UiState(
         cwd=cwd,
@@ -233,6 +242,8 @@ def _handler_factory(state: UiState):
         server_version = "OptPilotUI/0.1"
 
         def do_GET(self) -> None:  # noqa: N802
+            if not self._allow_request():
+                return
             parsed = urlparse(self.path)
             path = parsed.path
             query = parse_qs(parsed.query)
@@ -265,6 +276,8 @@ def _handler_factory(state: UiState):
                 self._send_json({"error": str(exc), "type": type(exc).__name__}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
 
         def do_POST(self) -> None:  # noqa: N802
+            if not self._allow_request():
+                return
             parsed = urlparse(self.path)
             try:
                 if parsed.path == "/api/studies/validate":
@@ -288,6 +301,8 @@ def _handler_factory(state: UiState):
                     self._send_json({"job": state.stop_job(job_id)})
                     return
                 self._send_json({"error": "Not found"}, status=HTTPStatus.NOT_FOUND)
+            except UiRequestError as exc:
+                self._send_json({"error": str(exc)}, status=exc.status)
             except KeyError as exc:
                 self._send_json({"error": f"Unknown id: {exc.args[0]}"}, status=HTTPStatus.NOT_FOUND)
             except Exception as exc:  # pragma: no cover - defensive HTTP boundary
@@ -300,7 +315,9 @@ def _handler_factory(state: UiState):
                 return
             run_id = parts[3]
             run_dir = _decode_id(run_id)
-            if not _is_run_dir(run_dir):
+            with state._lock:
+                job_roots = [job.output_root.resolve() for job in state.jobs.values()]
+            if not any(_is_relative_to(run_dir, root) for root in [*state.run_roots, *job_roots]) or not _is_run_dir(run_dir):
                 self._send_json({"error": "Run not found"}, status=HTTPStatus.NOT_FOUND)
                 return
             if len(parts) == 4:
@@ -341,14 +358,43 @@ def _handler_factory(state: UiState):
                 }
             )
 
+        def _allow_request(self) -> bool:
+            # The local UI can execute user code; reject remote browser origins
+            # and unrecognized Host headers before reading data or running jobs.
+            host = self.headers.get("Host", "")
+            allowed = {f"127.0.0.1:{self.server.server_port}", f"localhost:{self.server.server_port}"}
+            origin = self.headers.get("Origin")
+            if (host not in allowed or
+                    (origin is not None and origin != f"http://{host}") or
+                    self.headers.get("Sec-Fetch-Site") not in {None, "same-origin", "none"}):
+                self._send_json({"error": "Local same-origin requests only"}, status=HTTPStatus.FORBIDDEN)
+                return False
+            return True
+
         def _read_json_body(self) -> JsonDict:
-            length = int(self.headers.get("Content-Length", "0") or 0)
+            if self.headers.get_content_type() != "application/json":
+                raise UiRequestError("Content-Type must be application/json", HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
+            if self.headers.get("Transfer-Encoding"):
+                raise UiRequestError("Transfer-Encoding is not supported")
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError as exc:
+                raise UiRequestError("Invalid Content-Length") from exc
             if length <= 0:
-                return {}
-            return json.loads(self.rfile.read(length).decode("utf-8"))
+                raise UiRequestError("A JSON object is required")
+            if length > 1_000_000:
+                raise UiRequestError("Request body is too large", HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+            try:
+                payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            except (ValueError, UnicodeError) as exc:
+                raise UiRequestError("Invalid JSON body") from exc
+            if not isinstance(payload, dict):
+                raise UiRequestError("A JSON object is required")
+            return payload
 
         def _send_file(self, path: Path) -> None:
-            if not path.exists() or not path.is_file():
+            path = path.resolve()
+            if not _is_relative_to(path, static_dir.resolve()) or not path.is_file():
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return
             data = path.read_bytes()
@@ -356,6 +402,7 @@ def _handler_factory(state: UiState):
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", mime)
             self.send_header("Content-Length", str(len(data)))
+            self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
             self.wfile.write(data)
 
@@ -364,6 +411,7 @@ def _handler_factory(state: UiState):
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(data)))
+            self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
             self.wfile.write(data)
 
@@ -538,7 +586,7 @@ def _find_run_dirs(roots: Iterable[Path]) -> List[Path]:
         if not root.exists() or not root.is_dir():
             continue
         for path in root.rglob("*"):
-            if _is_run_dir(path):
+            if _is_relative_to(path.resolve(), root) and _is_run_dir(path):
                 run_dirs.append(path.resolve())
     return _dedupe_paths(run_dirs)
 
@@ -567,7 +615,7 @@ def _is_run_dir(path: Path) -> bool:
 def _list_run_files(run_dir: Path) -> List[JsonDict]:
     files = []
     for path in sorted(run_dir.rglob("*")):
-        if path.is_file():
+        if path.is_file() and _is_relative_to(path.resolve(), run_dir.resolve()):
             relative = path.relative_to(run_dir)
             stat = path.stat()
             files.append(
@@ -589,7 +637,7 @@ def _iter_yaml_files(root: Path) -> Iterable[Path]:
     for path in root.rglob("*"):
         if any(part in EXCLUDED_SCAN_DIRS for part in path.parts):
             continue
-        if path.is_file() and path.suffix.lower() in {".yaml", ".yml"}:
+        if path.is_file() and _is_relative_to(path.resolve(), root.resolve()) and path.suffix.lower() in {".yaml", ".yml"}:
             yield path.resolve()
 
 
@@ -627,7 +675,7 @@ def _failure_count(status_counts: JsonDict) -> int:
 
 
 def _parse_summary_from_stdout(path: Path) -> JsonDict:
-    if not path.exists():
+    if path.is_symlink() or not path.is_file():
         return {}
     text = path.read_text(encoding="utf-8", errors="replace").strip()
     if not text:
@@ -646,7 +694,7 @@ def _parse_summary_from_stdout(path: Path) -> JsonDict:
 
 
 def _read_json(path: Path) -> JsonDict:
-    if not path.exists():
+    if path.is_symlink() or not path.is_file():
         return {}
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -655,7 +703,7 @@ def _read_json(path: Path) -> JsonDict:
 
 
 def _read_jsonl(path: Path) -> List[JsonDict]:
-    if not path.exists():
+    if path.is_symlink() or not path.is_file():
         return []
     rows = []
     for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
